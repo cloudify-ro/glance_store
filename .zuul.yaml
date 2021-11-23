@@ -12,7 +12,6 @@
     vars:
       devstack_localrc:
         LIBS_FROM_GIT: glance_store
-        USE_PYTHON3: True
       devstack_services:
         # turn off ceilometer
         ceilometer-acentral: false
@@ -43,8 +42,6 @@
         s-container: true
         s-object: true
         s-proxy: true
-      devstack_localrc:
-        ENABLE_IDENTITY_V2: true
 
 - job:
     name: glance_store-tox-cinder-tips-base
@@ -156,8 +153,7 @@
     templates:
       - check-requirements
       - lib-forward-testing-python3
-      - openstack-lower-constraints-jobs
-      - openstack-python3-xena-jobs
+      - openstack-python3-yoga-jobs
       - publish-openstack-docs-pti
       - release-notes-jobs-python3
     check:
@@ -170,7 +166,6 @@
               - ^releasenotes/.*$
               - ^.*\.rst$
               - ^(test-|)requirements.txt$
-              - ^lower-constraints.txt$
               - ^setup.cfg$
               - ^tox.ini$
     experimental:

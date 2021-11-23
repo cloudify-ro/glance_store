@@ -33,6 +33,8 @@ from oslo_utils.secretutils import md5
 from oslo_utils import units
 
 import glance_store as store
+from glance_store.common import attachment_state_manager
+from glance_store.common import cinder_utils
 from glance_store import exceptions
 from glance_store import location
 from glance_store.tests import base
@@ -98,14 +100,15 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
             user_id='admin_user',
             auth_token='admin_token',
             project_id='admin_project')
+        cinder._reset_cinder_session()
 
     def test_location_url_prefix_is_set(self):
         self.assertEqual("cinder://cinder1", self.store.url_prefix)
 
     def test_get_cinderclient(self):
         cc = self.store.get_cinderclient(self.context)
-        self.assertEqual('fake_token', cc.client.auth_token)
-        self.assertEqual('http://foo/public_url', cc.client.management_url)
+        self.assertEqual('fake_token', cc.client.auth.token)
+        self.assertEqual('http://foo/public_url', cc.client.auth.endpoint)
 
     def test_get_cinderclient_with_user_overriden(self):
         self.config(cinder_store_user_name='test_user', group="cinder1")
@@ -113,16 +116,14 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
         self.config(cinder_store_project_name='test_project', group="cinder1")
         self.config(cinder_store_auth_address='test_address', group="cinder1")
         cc = self.store.get_cinderclient(self.context)
-        self.assertIsNone(cc.client.auth_token)
-        self.assertEqual('test_address', cc.client.management_url)
+        self.assertEqual('Default', cc.client.session.auth.project_domain_name)
+        self.assertEqual('test_project', cc.client.session.auth.project_name)
 
     def test_get_cinderclient_legacy_update(self):
         cc = self.store.get_cinderclient(self.fake_admin_context,
                                          legacy_update=True)
-        self.assertEqual('admin_token', cc.client.auth_token)
-        self.assertEqual('admin_user', cc.client.user)
-        self.assertEqual('admin_project', cc.client.projectid)
-        self.assertEqual('http://foo/public_url', cc.client.management_url)
+        self.assertEqual('admin_token', cc.client.auth.token)
+        self.assertEqual('http://foo/public_url', cc.client.auth.endpoint)
 
     def test_temporary_chown(self):
         class fake_stat(object):
@@ -183,11 +184,23 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
 
     def _test_open_cinder_volume(self, open_mode, attach_mode, error,
                                  multipath_supported=False,
-                                 enforce_multipath=False):
+                                 enforce_multipath=False,
+                                 encrypted_nfs=False, qcow2_vol=False,
+                                 multiattach=False):
         self.config(cinder_mount_point_base=None, group='cinder1')
-        fake_volume = mock.MagicMock(id=str(uuid.uuid4()), status='available')
-        fake_volumes = FakeObject(get=lambda id: fake_volume,
-                                  detach=mock.Mock())
+        fake_volume = mock.MagicMock(id=str(uuid.uuid4()), status='available',
+                                     multiattach=multiattach)
+        fake_volume.manager.get.return_value = fake_volume
+        fake_attachment_id = str(uuid.uuid4())
+        fake_attachment_create = {'id': fake_attachment_id}
+        if encrypted_nfs or qcow2_vol:
+            fake_attachment_update = mock.MagicMock(
+                id=fake_attachment_id,
+                connection_info={'driver_volume_type': 'nfs'})
+        else:
+            fake_attachment_update = mock.MagicMock(id=fake_attachment_id)
+        fake_conn_info = mock.MagicMock(connector={})
+        fake_volumes = FakeObject(get=lambda id: fake_volume)
         fake_client = FakeObject(volumes=fake_volumes)
         _, fake_dev_path = tempfile.mkstemp(dir=self.test_dir)
         fake_devinfo = {'path': fake_dev_path}
@@ -200,14 +213,22 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
             yield
 
         def do_open():
-            with self.store._open_cinder_volume(
-                    fake_client, fake_volume, open_mode):
-                if error:
-                    raise error
+            if multiattach:
+                with mock.patch.object(
+                        attachment_state_manager._AttachmentStateManager,
+                        'get_state') as mock_get_state:
+                    mock_get_state.return_value.__enter__.return_value = (
+                        attachment_state_manager._AttachmentState())
+                    with self.store._open_cinder_volume(
+                            fake_client, fake_volume, open_mode):
+                        pass
+            else:
+                with self.store._open_cinder_volume(
+                        fake_client, fake_volume, open_mode):
+                    if error:
+                        raise error
 
         def fake_factory(protocol, root_helper, **kwargs):
-            self.assertEqual(fake_volume.initialize_connection.return_value,
-                             kwargs['conn'])
             return fake_connector
 
         root_helper = "sudo glance-rootwrap /etc/glance/rootwrap.conf"
@@ -219,28 +240,82 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
                 mock.patch.object(cinder.Store, 'get_root_helper',
                                   return_value=root_helper), \
                 mock.patch.object(connector.InitiatorConnector, 'factory',
-                                  side_effect=fake_factory) as fake_conn_obj:
+                                  side_effect=fake_factory
+                                  ) as fake_conn_obj, \
+                mock.patch.object(cinder_utils.API,
+                                  'attachment_create',
+                                  return_value=fake_attachment_create
+                                  ) as attach_create, \
+                mock.patch.object(cinder_utils.API,
+                                  'attachment_update',
+                                  return_value=fake_attachment_update
+                                  ) as attach_update, \
+                mock.patch.object(cinder_utils.API,
+                                  'attachment_delete') as attach_delete, \
+                mock.patch.object(cinder_utils.API,
+                                  'attachment_get') as attach_get, \
+                mock.patch.object(cinder_utils.API,
+                                  'attachment_complete') as attach_complete:
 
             with mock.patch.object(connector,
-                                   'get_connector_properties') as mock_conn:
+                                   'get_connector_properties',
+                                   return_value=fake_conn_info) as mock_conn:
                 if error:
                     self.assertRaises(error, do_open)
+                elif encrypted_nfs or qcow2_vol:
+                    fake_volume.encrypted = False
+                    if encrypted_nfs:
+                        fake_volume.encrypted = True
+                    elif qcow2_vol:
+                        attach_get.return_value = mock.MagicMock(
+                            connection_info={'format': 'qcow2'})
+                    try:
+                        with self.store._open_cinder_volume(
+                                fake_client, fake_volume, open_mode):
+                            pass
+                    except exceptions.BackendException:
+                        attach_delete.assert_called_once_with(
+                            fake_client, fake_attachment_id)
                 else:
                     do_open()
-
-                mock_conn.assert_called_once_with(
-                    root_helper, socket.gethostname(), multipath_supported,
-                    enforce_multipath)
-                fake_connector.connect_volume.assert_called_once_with(mock.ANY)
-                fake_connector.disconnect_volume.assert_called_once_with(
-                    mock.ANY, fake_devinfo)
-                fake_volume.attach.assert_called_once_with(
-                    None, 'glance_store', attach_mode,
-                    host_name=socket.gethostname())
-                fake_volumes.detach.assert_called_once_with(fake_volume)
-                fake_conn_obj.assert_called_once_with(
-                    mock.ANY, root_helper, conn=mock.ANY,
-                    use_multipath=multipath_supported)
+                if not (encrypted_nfs or qcow2_vol):
+                    mock_conn.assert_called_once_with(
+                        root_helper, socket.gethostname(),
+                        multipath_supported, enforce_multipath)
+                    fake_connector.connect_volume.assert_called_once_with(
+                        mock.ANY)
+                    fake_connector.disconnect_volume.assert_called_once_with(
+                        mock.ANY, fake_devinfo)
+                    fake_conn_obj.assert_called_once_with(
+                        mock.ANY, root_helper, conn=mock.ANY,
+                        use_multipath=multipath_supported)
+                    attach_create.assert_called_once_with(
+                        fake_client, fake_volume.id, mode=attach_mode)
+                    attach_update.assert_called_once_with(
+                        fake_client, fake_attachment_id,
+                        fake_conn_info, mountpoint='glance_store')
+                    attach_complete.assert_called_once_with(
+                        fake_client, fake_attachment_id)
+                    attach_delete.assert_called_once_with(fake_client,
+                                                          fake_attachment_id)
+                else:
+                    mock_conn.assert_called_once_with(
+                        root_helper, socket.gethostname(),
+                        multipath_supported, enforce_multipath)
+                    fake_connector.connect_volume.assert_not_called()
+                    fake_connector.disconnect_volume.assert_not_called()
+                    fake_conn_obj.assert_called_once_with(
+                        mock.ANY, root_helper, conn=mock.ANY,
+                        use_multipath=multipath_supported)
+                    attach_create.assert_called_once_with(
+                        fake_client, fake_volume.id, mode=attach_mode)
+                    attach_update.assert_called_once_with(
+                        fake_client, fake_attachment_id,
+                        fake_conn_info, mountpoint='glance_store')
+                    attach_complete.assert_called_once_with(
+                        fake_client, fake_attachment_id)
+                    attach_delete.assert_called_once_with(
+                        fake_client, fake_attachment_id)
 
     def test_open_cinder_volume_rw(self):
         self._test_open_cinder_volume('wb', 'rw', None)
@@ -263,6 +338,15 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
         self._test_open_cinder_volume('wb', 'rw', None,
                                       multipath_supported=True,
                                       enforce_multipath=True)
+
+    def test_open_cinder_volume_nfs_encrypted(self):
+        self._test_open_cinder_volume('rb', 'ro', None, encrypted_nfs=True)
+
+    def test_open_cinder_volume_nfs_qcow2_volume(self):
+        self._test_open_cinder_volume('rb', 'ro', None, qcow2_vol=True)
+
+    def test_open_cinder_volume_multiattach_volume(self):
+        self._test_open_cinder_volume('rb', 'ro', None, multiattach=True)
 
     def test_cinder_check_context(self):
         self.assertRaises(exceptions.BadStoreConfiguration,
@@ -500,8 +584,7 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
     def test_cinder_delete(self):
         fake_client = FakeObject(auth_token=None, management_url=None)
         fake_volume_uuid = str(uuid.uuid4())
-        fake_volume = FakeObject(delete=mock.Mock())
-        fake_volumes = {fake_volume_uuid: fake_volume}
+        fake_volumes = FakeObject(delete=mock.Mock())
 
         with mock.patch.object(cinder.Store, 'get_cinderclient') as mocked_cc:
             mocked_cc.return_value = FakeObject(client=fake_client,
@@ -512,7 +595,7 @@ class TestMultiCinderStore(base.MultiStoreBaseTest,
                                                              "cinder1",
                                                              conf=self.conf)
             self.store.delete(loc, context=self.context)
-            fake_volume.delete.assert_called_once_with()
+            fake_volumes.delete.assert_called_once_with(fake_volume_uuid)
 
     def test_cinder_add_different_backend(self):
         self.store = cinder.Store(self.conf, backend="cinder2")

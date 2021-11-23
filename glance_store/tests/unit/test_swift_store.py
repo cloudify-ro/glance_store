@@ -479,6 +479,33 @@ class SwiftTests(object):
             expected_image_id, image_swift, expected_swift_size, HASH_ALGO)
         self.assertEqual(expected_location, location)
 
+    def test_add_raises_storage_full(self):
+
+        conf = copy.deepcopy(SWIFT_CONF)
+        conf['default_swift_reference'] = 'store_2'
+        self.config(**conf)
+        moves.reload_module(swift)
+        self.mock_keystone_client()
+        self.store = Store(self.conf)
+        self.store.configure()
+
+        def fake_put_object_entity_too_large(*args, **kwargs):
+            msg = "Test Out of Quota"
+            raise swiftclient.ClientException(
+                msg, http_status=http_client.REQUEST_ENTITY_TOO_LARGE)
+
+        self.useFixture(fixtures.MockPatch(
+            'swiftclient.client.put_object', fake_put_object_entity_too_large))
+
+        expected_swift_size = FIVE_KB
+        expected_swift_contents = b"*" * expected_swift_size
+        expected_image_id = str(uuid.uuid4())
+        image_swift = six.BytesIO(expected_swift_contents)
+
+        self.assertRaises(exceptions.StorageFull, self.store.add,
+                          expected_image_id, image_swift,
+                          expected_swift_size, HASH_ALGO)
+
     @mock.patch('glance_store._drivers.swift.utils'
                 '.is_multiple_swift_store_accounts_enabled',
                 mock.Mock(return_value=False))
@@ -1533,6 +1560,31 @@ class TestSingleTenantStoreConnections(base.StoreBaseTest):
         self.assertEqual({'service_type': 'object-store',
                           'endpoint_type': 'publicURL'},
                          connection.os_options)
+
+    @mock.patch("keystoneauth1.session.Session.get_endpoint")
+    @mock.patch("keystoneauth1.session.Session.get_auth_headers",
+                new=mock.Mock())
+    def _test_connection_manager_authv3_conf_endpoint(
+            self, mock_ep, expected_endpoint="https://from-catalog.com"):
+        self.config(swift_store_auth_version='3')
+        mock_ep.return_value = "https://from-catalog.com"
+        ctx = mock.MagicMock()
+        self.store.configure()
+        connection_manager = manager.SingleTenantConnectionManager(
+            store=self.store,
+            store_location=self.location,
+            context=ctx
+        )
+        conn = connection_manager._init_connection()
+        self.assertEqual(expected_endpoint, conn.preauthurl)
+
+    def test_connection_manager_authv3_without_conf_endpoint(self):
+        self._test_connection_manager_authv3_conf_endpoint()
+
+    def test_connection_manager_authv3_with_conf_endpoint(self):
+        self.config(swift_store_endpoint='http://localhost')
+        self._test_connection_manager_authv3_conf_endpoint(
+            expected_endpoint='http://localhost')
 
     def test_connection_with_no_trailing_slash(self):
         self.location.auth_or_store_url = 'example.com/v2'

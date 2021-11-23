@@ -95,4 +95,16 @@ latex_documents = [
 # It would never happen in a real scenario as it is only imported
 # from cinder store after the config are loaded but to handle doc
 # failures, we mock it here.
-autodoc_mock_imports = ['glance_store.common.fs_mount']
+# The cinder_utils module imports external dependencies like
+# cinderclient, retrying etc which are not recognized by
+# autodoc, hence, are mocked here. These dependencies are installed
+# during an actual deployment and won't cause any issue during usage.
+autodoc_mock_imports = ['glance_store.common.fs_mount',
+                        'glance_store.common.cinder_utils']
+
+# Since version 4.2.0, Sphinx emits a warning when encountering a mocked
+# object, leading to the following error:
+#   "A mocked object is detected: 'glance_store.common.cinder_utils'"
+# To prevent this, we disable all warnings from the autodoc extension, since
+# there is no finer grain yet.
+suppress_warnings = ['autodoc.*']
